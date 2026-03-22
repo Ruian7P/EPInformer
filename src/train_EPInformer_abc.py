@@ -32,7 +32,7 @@ from sklearn.model_selection import train_test_split
 from kipoiseq import Interval
 import pyfaidx
 import kipoiseq
-from EPInformer.models_abc import EPInformer_abc, EPInformer_v2, EPInformer_abc_dist, EPInformer_abc_dist_v2, enhancer_predictor_256bp
+from EPInformer.models_abc import *
 
 # def df_to_pyranges(df, start_col='start', end_col='end', chr_col='chr', start_slop=0, end_slop=0):
 #     df['Chromosome'] = df[chr_col]
@@ -428,7 +428,7 @@ parser = argparse.ArgumentParser()
 def list_of_strings(arg):
     return arg.split(',')
 parser.add_argument('--cuda_id', type=int, help='cuda id', default=0)
-parser.add_argument('--model_type', type=str, help='model type', default='EPInformer-v2', choices=['EPInformer-v2', 'EPInformer-abc', 'EPInformer-abc-dist', 'EPInformer-abc-dist-v2'])
+parser.add_argument('--model_type', type=str, help='model type', default='EPInformer-v2')
 parser.add_argument('--expr_type', type=str, help='expression type', default='RNA', choices=['CAGE', 'RNA'])
 parser.add_argument('--n_enh_feats', type=int, help='number of enhancer features', default=3, choices=[1, 2, 3])
 parser.add_argument('--cell', type=str, help='cell type', default='K562', choices=['K562', 'GM12878', 'HepG2'])
@@ -441,19 +441,20 @@ os.environ["CUDA_VISIBLE_DEVICES"]= str(args.cuda_id)
 os.makedirs('/dev/shm/data/', exist_ok=True)
 # copy data 
 
+
 results = []
 expr_type = args.expr_type
-batch_size = 50
+batch_size = 64
 max_n_enh = 60
 dist_thr = 100_000
-lr = 0.0001
+lr = 5e-4
 model_type = args.model_type
 use_pretrained_encoder = args.use_pretrained_encoder
 cell_type = args.cell
 # use_prm_signal = args.use_prm_signal
 use_prm_signal = args.use_prm_signal
 print('use_prm_signal:', use_prm_signal)
-model_dist = {'EPInformer-abc': EPInformer_abc, 'EPInformer-v2': EPInformer_v2, 'EPInformer-abc-dist': EPInformer_abc_dist, 'EPInformer-abc-dist-v2':EPInformer_abc_dist_v2}
+model_dist = {'EPInformer-abc': EPInformer_abc, 'EPInformer-v2': EPInformer_v2, 'EPInformer-abc-dist': EPInformer_abc_dist, 'EPInformer-abc-dist-v2':EPInformer_abc_dist_v2, 'EPInformer-promoter-v2': EPInformer_promoter_v2}
 available_fold_cols = [c for c in split_df.columns if c.startswith('fold_')]
 if len(available_fold_cols) == 0:
     raise ValueError('No fold columns found in split file. Expected columns like fold_1 / fold_borzoi.')
@@ -523,7 +524,7 @@ for fi in fold_ids:# range(1, 13):
                 total_params = sum(np.prod(p.size()) for p in model_parameters)  
                 print(cell, 'fold', fi, 'total', total_params/1_000_000, 'M params')
                 print(model.name)
-                saved_model_path = './EPInformer_models_20250629/'
+                saved_model_path = f'./results/{model_type}/'
                 # Train the model
                 train(model, train_ds, valid_dataset=valid_ds, learning_rate=lr, EPOCHS=50, model_name = model.name, fold_i=fi, batch_size=batch_size, device=device, saved_model_path=saved_model_path)
                 # Test the model
@@ -537,6 +538,6 @@ for fi in fold_ids:# range(1, 13):
                 results.append(test_df)
 
 results_df = pd.concat(results)
-result_path = './EPInformer_predictions_20250629/'
+result_path = f'./results/{model_type}/'
 os.makedirs(result_path, exist_ok=True)
 results_df.to_csv('{}{}_results.csv'.format(result_path, model.name), index=False)

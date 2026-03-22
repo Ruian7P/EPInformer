@@ -935,23 +935,14 @@ class EPInformer_promoter_v2(nn.Module):
                 # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
                 nn.ELU(),
             )
-        n_feat = 0
-        if self.useFeat:
-            if self.usePromoterSignal:
-                n_feat = 9
-            else:
-                n_feat = 8
+
         self.pToExpr = nn.Sequential(
-                        nn.Linear(self.out_dim+n_feat, 128),
+                        nn.Linear(self.out_dim, 128),
                         nn.ReLU(),
                         nn.Linear(128, 128),
                         nn.ReLU(),
                         nn.Linear(128, 1),
                     )
-        if n_extraFeat == 0:
-            n_extraFeat = n_extraFeat + 1
-
-        assert useFeat == False and usePromoterSignal == False, "Currently only support using promoter signal as extra feature, please set useFeat=False and usePromoterSignal=False if you want to use this model"
 
 
     def forward(self, pe_seq, rna_feats=None, enh_feats=None):
@@ -960,6 +951,7 @@ class EPInformer_promoter_v2(nn.Module):
         pe_embed = self.conv_out(pe_embed)
         pe_flatten_embed = torch.flatten(pe_embed.permute(0, 2, 1, 3), start_dim=2)
         
+        # self attention
         attn_list = []
         for i in range(self.n_encoder):
             pe_flatten_embed, attn = self.attn_encoder[i](pe_flatten_embed, enhancers_padding_mask=None, attn_mask=None)
