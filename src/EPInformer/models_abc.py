@@ -961,3 +961,85 @@ class EPInformer_promoter_v2(nn.Module):
         p_embed = pe_flatten_embed[:,0,:]
         expr_out = self.pToExpr(p_embed).squeeze(-1)
         return expr_out, torch.cat(attn_list)
+    
+
+
+class MoPInformer_P(nn.Module):
+    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True):
+        super(MoPInformer_P, self).__init__()
+        self.n_enhancer = n_enhancer
+        self.out_dim = out_dim
+        self.useFeat = useFeat
+        self.usePromoterSignal = usePromoterSignal
+        self.n_extraFeat = n_extraFeat
+        self.useBN = useBN
+        self.base_size = base_size
+        self.useLN = useLN
+        if pre_trained_encoder is not None:
+            self.seq_encoder = pre_trained_encoder
+            self.name = 'MoPInformer-P.preTrainedConv'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN, useLN, useFeat, n_extraFeat, n_enhancer) 
+        else:
+            self.seq_encoder = seq_256bp_encoder(base_size=base_size)
+            self.name = 'MoPInformer-P'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN,useLN, useFeat, n_extraFeat, n_enhancer)
+        self.n_encoder = n_encoder
+        self.device = device
+        self.attn_encoder = get_clones(MHAttention_encoderLayer(d_model=out_dim, nhead=head), self.n_encoder)
+        if self.useBN:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 128, out_channels=64, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=32, kernel_size=(1, 1)),
+                nn.BatchNorm2d(32),
+                nn.ELU(),
+                nn.Linear(109, int(self.out_dim/32)), 
+                 # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+        else:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 128, out_channels=64, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=32, kernel_size=(1, 1)),
+                nn.ELU(),
+                nn.Linear(109, int(self.out_dim/32)),
+                # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+
+        self.pToExpr = nn.Sequential(
+                        nn.Linear(self.out_dim, 128),
+                        nn.ReLU(),
+                        nn.Linear(128, 128),
+                        nn.ReLU(),
+                        nn.Linear(128, 1),
+                    )
+
+
+    def forward(self, pe_seq, rna_feats=None, enh_feats=None):
+        pe_seq = pe_seq[:, :1, :, :]
+        pe_embed = self.seq_encoder(pe_seq)
+        pe_embed = self.conv_out(pe_embed)
+        pe_flatten_embed = torch.flatten(pe_embed.permute(0, 2, 1, 3), start_dim=2)
+        
+        # self attention
+        attn_list = []
+        for i in range(self.n_encoder):
+            pe_flatten_embed, attn = self.attn_encoder[i](pe_flatten_embed, enhancers_padding_mask=None, attn_mask=None)
+            attn_list.append(attn.unsqueeze(0))
+        # Guide attention module
+
+        p_embed = pe_flatten_embed[:,0,:]
+        expr_out = self.pToExpr(p_embed).squeeze(-1)
+        return expr_out, torch.cat(attn_list)
+
