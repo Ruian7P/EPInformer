@@ -1061,3 +1061,121 @@ class MoPInformer_P(nn.Module):
         expr_out = self.pToExpr(p_embed).squeeze(-1)
         return expr_out, (torch.cat(attn_list), cross_attn_w)
 
+
+
+class MoPInformer(nn.Module):
+    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0):
+        super(MoPInformer, self).__init__()
+        self.n_enhancer = n_enhancer
+        self.out_dim = out_dim
+        self.useFeat = useFeat
+        self.usePromoterSignal = usePromoterSignal
+        self.n_extraFeat = n_extraFeat
+        self.useBN = useBN
+        self.base_size = base_size
+        self.useLN = useLN
+        self.motif_feat_dim = motif_feat_dim
+        if pre_trained_encoder is not None:
+            self.seq_encoder = pre_trained_encoder
+            self.name = 'MoPInformer.preTrainedConv'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN, useLN, useFeat, n_extraFeat, n_enhancer) 
+        else:
+            self.seq_encoder = seq_256bp_encoder(base_size=base_size)
+            self.name = 'MoPInformer'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN,useLN, useFeat, n_extraFeat, n_enhancer)
+        self.n_encoder = n_encoder
+        self.device = device
+        self.attn_encoder = get_clones(MHAttention_encoderLayer(d_model=out_dim, nhead=head), self.n_encoder)
+        attn_mask = (~np.identity(self.n_enhancer+1).astype(bool))
+        attn_mask[:, 0] = False
+        attn_mask[0, :] = False
+        attn_mask = torch.from_numpy(attn_mask)
+        attn_mask.masked_fill(attn_mask, float('-inf'))
+        self.attn_mask = attn_mask
+        if self.useBN:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 128, out_channels=64, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.BatchNorm2d(64),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=32, kernel_size=(1, 1)),
+                nn.BatchNorm2d(32),
+                nn.ELU(),
+                nn.Linear(109, int(self.out_dim/32)), 
+                 # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+        else:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 128, out_channels=64, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=64, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 64, out_channels=32, kernel_size=(1, 1)),
+                nn.ELU(),
+                nn.Linear(109, int(self.out_dim/32)),
+                # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+        n_feat = 0
+        if self.useFeat:
+            if self.usePromoterSignal:
+                n_feat = 9
+            else:
+                n_feat = 8
+        self.pToExpr = nn.Sequential(
+                        nn.Linear(self.out_dim+n_feat, 128),
+                        nn.ReLU(),
+                        nn.Linear(128, 128),
+                        nn.ReLU(),
+                        nn.Linear(128, 1),
+                    )
+        if n_extraFeat == 0:
+            n_extraFeat = n_extraFeat + 1
+        self.add_pos_conv = nn.Sequential(
+                nn.Conv1d(in_channels = self.out_dim+n_extraFeat, out_channels=self.out_dim, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv1d(in_channels = self.out_dim, out_channels=self.out_dim, kernel_size=1),
+                nn.ReLU(),
+        )
+
+        # Motif encoder and cross attention
+        self.motif_encoder = nn.Sequential(
+            nn.Linear(self.motif_feat_dim, motif_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(motif_hidden_dim, self.out_dim),
+            nn.ReLU(),
+        )
+        self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
+        self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
+
+    def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats=None):
+        enhancers_padding_mask = ~(pe_seq.sum(-1).sum(-1) > 0).bool()
+        pe_embed = self.seq_encoder(pe_seq)
+        pe_embed = self.conv_out(pe_embed)
+        pe_flatten_embed = torch.flatten(pe_embed.permute(0, 2, 1, 3), start_dim=2)
+        if enh_feats is not None:
+            pe_flatten_embed = self.add_pos_conv(torch.concat([pe_flatten_embed, enh_feats], axis=-1).permute(0,2,1)).permute(0,2,1)
+        attn_list = []
+        for i in range(self.n_encoder):
+            pe_flatten_embed, attn = self.attn_encoder[i](pe_flatten_embed, enhancers_padding_mask=enhancers_padding_mask, attn_mask=self.attn_mask.to(self.device))
+            attn_list.append(attn.unsqueeze(0))
+
+        # Cross attention from promoter-enhancer tokens to motif token(s).
+        cross_attn_w = None
+        if motif_feats is not None:
+            motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
+            query = self.cross_attn_norm_q(pe_flatten_embed)
+            cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
+            pe_flatten_embed = pe_flatten_embed + cross_out
+
+        p_embed = pe_flatten_embed[:,0,:]
+        if rna_feats is not None:
+            p_embed = torch.cat((p_embed, rna_feats), axis=-1)
+        expr_out = self.pToExpr(p_embed).squeeze(-1)
+        return expr_out, (torch.cat(attn_list), cross_attn_w)

@@ -474,7 +474,7 @@ cell_type = args.cell
 # use_prm_signal = args.use_prm_signal
 use_prm_signal = args.use_prm_signal
 print('use_prm_signal:', use_prm_signal)
-model_dist = {'MoPInformer-P': MoPInformer_P}
+model_dist = {'MoPInformer-P': MoPInformer_P, 'MoPInformer': MoPInformer}
 available_fold_cols = [c for c in split_df.columns if c.startswith('fold_')]
 if len(available_fold_cols) == 0:
     raise ValueError('No fold columns found in split file. Expected columns like fold_1 / fold_borzoi.')
