@@ -965,7 +965,7 @@ class EPInformer_promoter_v2(nn.Module):
 
 
 class MoPInformer_P(nn.Module):
-    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True):
+    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0):
         super(MoPInformer_P, self).__init__()
         self.n_enhancer = n_enhancer
         self.out_dim = out_dim
@@ -975,6 +975,7 @@ class MoPInformer_P(nn.Module):
         self.useBN = useBN
         self.base_size = base_size
         self.useLN = useLN
+        self.motif_feat_dim = motif_feat_dim
         if pre_trained_encoder is not None:
             self.seq_encoder = pre_trained_encoder
             self.name = 'MoPInformer-P.preTrainedConv'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN, useLN, useFeat, n_extraFeat, n_enhancer) 
@@ -1025,8 +1026,18 @@ class MoPInformer_P(nn.Module):
                         nn.Linear(128, 1),
                     )
 
+        # Motif encoder and cross attention
+        self.motif_encoder = nn.Sequential(
+            nn.Linear(self.motif_feat_dim, motif_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(motif_hidden_dim, self.out_dim),
+            nn.ReLU(),
+        )
+        self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
+        self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
 
-    def forward(self, pe_seq, rna_feats=None, enh_feats=None):
+
+    def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats = None):
         pe_seq = pe_seq[:, :1, :, :]
         pe_embed = self.seq_encoder(pe_seq)
         pe_embed = self.conv_out(pe_embed)
@@ -1037,9 +1048,16 @@ class MoPInformer_P(nn.Module):
         for i in range(self.n_encoder):
             pe_flatten_embed, attn = self.attn_encoder[i](pe_flatten_embed, enhancers_padding_mask=None, attn_mask=None)
             attn_list.append(attn.unsqueeze(0))
-        # Guide attention module
+
+        # Cross attention from promoter token(s) to motif token(s).
+        cross_attn_w = None
+        if motif_feats is not None:
+            motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
+            query = self.cross_attn_norm_q(pe_flatten_embed)
+            cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
+            pe_flatten_embed = pe_flatten_embed + cross_out
 
         p_embed = pe_flatten_embed[:,0,:]
         expr_out = self.pToExpr(p_embed).squeeze(-1)
-        return expr_out, torch.cat(attn_list)
+        return expr_out, (torch.cat(attn_list), cross_attn_w)
 
