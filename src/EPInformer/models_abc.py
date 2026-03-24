@@ -24,17 +24,28 @@ def get_clones(module, N):
 class seq_256bp_encoder(nn.Module):
     def __init__(self, base_size=4, out_dim=128, conv_dim=256):
         super(seq_256bp_encoder, self).__init__()
-        self.conv_dim = conv_dim
+        # if conv_dim is list:
+        if isinstance(conv_dim, int):
+            self.conv_dim = conv_dim
+            self.stem_conv = nn.Sequential(
+                nn.Conv2d(in_channels = base_size, out_channels = self.conv_dim, kernel_size = (1, 8), stride = 1, padding='same'),
+                nn.ELU(),
+            )
+            conv_dim = [self.conv_dim, 128, 64, 64, 128]
+        else:
+            self.conv_dim = conv_dim[0]
+            self.stem_conv = nn.Sequential(
+                nn.Conv2d(in_channels = base_size, out_channels = self.conv_dim, kernel_size = (1, 8), stride = 1, padding='same'),
+                nn.ELU(),
+            )
+            conv_dim = conv_dim
+
         self.out_dim = out_dim
         self.base_size = base_size
         # cropped_len = 46
-        self.stem_conv = nn.Sequential(
-            nn.Conv2d(in_channels = base_size, out_channels = self.conv_dim, kernel_size = (1, 8), stride = 1, padding='same'),
-            nn.ELU(),
-        )
         self.conv_tower = nn.ModuleList([])
-        conv_dim = [self.conv_dim, 128, 64, 64, 128]
-        for i in range(4):
+
+        for i in range(len(conv_dim) - 1):
             self.conv_tower.append(nn.Sequential(
                 nn.Conv2d(in_channels = conv_dim[i], out_channels=conv_dim[i+1], kernel_size=(1, 3), padding=(0, 1)),
                 nn.BatchNorm2d(conv_dim[i+1]),
@@ -1060,6 +1071,101 @@ class MoPInformer_P(nn.Module):
         p_embed = pe_flatten_embed[:,0,:]
         expr_out = self.pToExpr(p_embed).squeeze(-1)
         return expr_out, (torch.cat(attn_list), cross_attn_w)
+
+
+
+class MoPInformer_P_small(nn.Module):
+    def __init__(self, base_size = 4, n_encoder=2, out_dim=32, head = 2, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=16, cross_attn_dropout=0.0):
+        super(MoPInformer_P_small, self).__init__()
+        self.n_enhancer = n_enhancer
+        self.out_dim = out_dim
+        self.useFeat = useFeat
+        self.usePromoterSignal = usePromoterSignal
+        self.n_extraFeat = n_extraFeat
+        self.useBN = useBN
+        self.base_size = base_size
+        self.useLN = useLN
+        self.motif_feat_dim = motif_feat_dim
+        if self.out_dim % 16 != 0:
+            raise ValueError('MoPInformer_P_small requires out_dim to be divisible by 16.')
+        if pre_trained_encoder is not None:
+            self.seq_encoder = pre_trained_encoder
+            self.name = 'MoPInformer-P.small.preTrainedConv'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN, useLN, useFeat, n_extraFeat, n_enhancer) 
+        else:
+            self.seq_encoder = seq_256bp_encoder(base_size=base_size, conv_dim=[32, 32])
+            self.name = 'MoPInformer-P.small'# .{}base.{}dim.{}Trans.{}head.{}BN.{}LN.{}Feat.{}extraFeat.{}enh'.format(base_size, out_dim, n_encoder, head, useBN,useLN, useFeat, n_extraFeat, n_enhancer)
+        self.n_encoder = n_encoder
+        self.device = device
+        self.attn_encoder = get_clones(MHAttention_encoderLayer(d_model=out_dim, nhead=head), self.n_encoder)
+        if self.useBN:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 32, out_channels=16, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.BatchNorm2d(16),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 16, out_channels=16, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.BatchNorm2d(16),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 16, out_channels=8, kernel_size=(1, 1)),
+                nn.BatchNorm2d(8),
+                nn.ELU(),
+                nn.LazyLinear(int(self.out_dim/8)), 
+                 # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+        else:
+            self.conv_out = nn.Sequential(
+                nn.Conv2d(in_channels = 32, out_channels=16, kernel_size=(1, 3), dilation=(1, 2)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 16, out_channels=16, kernel_size=(1, 3), dilation=(1, 3)),
+                nn.ELU(),
+                nn.Conv2d(in_channels = 16, out_channels=8, kernel_size=(1, 1)),
+                nn.ELU(),
+                nn.LazyLinear(int(self.out_dim/8)),
+                # nn.Linear(38, 8), # 2kb nn.Linear(101, 8)
+                nn.ELU(),
+            )
+
+        self.pToExpr = nn.Sequential(
+                        nn.Linear(self.out_dim, 32),
+                        nn.ReLU(),
+                        nn.Linear(32, 1),
+                    )
+
+        # Motif encoder and cross attention
+        self.motif_encoder = nn.Sequential(
+            nn.Linear(self.motif_feat_dim, motif_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(motif_hidden_dim, self.out_dim),
+            nn.ReLU(),
+        )
+        self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
+        self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
+
+
+    def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats = None):
+        pe_seq = pe_seq[:, :1, :, :]
+        pe_embed = self.seq_encoder(pe_seq)
+        pe_embed = self.conv_out(pe_embed)
+        pe_flatten_embed = torch.flatten(pe_embed.permute(0, 2, 1, 3), start_dim=2)
+        
+        # self attention
+        attn_list = []
+        for i in range(self.n_encoder):
+            pe_flatten_embed, attn = self.attn_encoder[i](pe_flatten_embed, enhancers_padding_mask=None, attn_mask=None)
+            attn_list.append(attn.unsqueeze(0))
+
+        # Cross attention from promoter token(s) to motif token(s).
+        cross_attn_w = None
+        if motif_feats is not None:
+            motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
+            query = self.cross_attn_norm_q(pe_flatten_embed)
+            cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
+            pe_flatten_embed = pe_flatten_embed + cross_out
+
+        p_embed = pe_flatten_embed[:,0,:]
+        expr_out = self.pToExpr(p_embed).squeeze(-1)
+        return expr_out, (torch.cat(attn_list), cross_attn_w)
+
 
 
 

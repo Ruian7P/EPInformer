@@ -447,9 +447,9 @@ parser = argparse.ArgumentParser()
 def list_of_strings(arg):
     return arg.split(',')
 parser.add_argument('--cuda_id', type=int, help='cuda id', default=0)
-parser.add_argument('--model_type', type=str, help='model type', default='MoPInformer-P')
 parser.add_argument('--expr_type', type=str, help='expression type', default='RNA', choices=['CAGE', 'RNA'])
 parser.add_argument('--n_enh_feats', type=int, help='number of enhancer features', default=3, choices=[1, 2, 3])
+parser.add_argument('--model_type', type=str, help='model type', default='MoPInformer-P')
 parser.add_argument('--cell', type=str, help='cell type', default='K562', choices=['K562', 'GM12878', 'HepG2'])
 parser.add_argument('--use_prm_signal', type=bool, help='use promoter signal', default=False)
 parser.add_argument('--use_pretrained_encoder', type=bool, help='use pretrained encoder', default=False)
@@ -474,7 +474,7 @@ cell_type = args.cell
 # use_prm_signal = args.use_prm_signal
 use_prm_signal = args.use_prm_signal
 print('use_prm_signal:', use_prm_signal)
-model_dist = {'MoPInformer-P': MoPInformer_P, 'MoPInformer': MoPInformer}
+model_dist = {'MoPInformer-P': MoPInformer_P, 'MoPInformer': MoPInformer, 'MoPInformer-P-small': MoPInformer_P_small}
 available_fold_cols = [c for c in split_df.columns if c.startswith('fold_')]
 if len(available_fold_cols) == 0:
     raise ValueError('No fold columns found in split file. Expected columns like fold_1 / fold_borzoi.')
