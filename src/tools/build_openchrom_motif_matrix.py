@@ -32,6 +32,33 @@ def parse_args() -> argparse.Namespace:
         help="How to aggregate filtered hits into gene x motif values",
     )
     parser.add_argument(
+        "--position-bins",
+        type=int,
+        default=0,
+        help=(
+            "Optional number of promoter-relative bins for positional features. "
+            "If > 0, output features become motif__bin{idx} instead of motif-only. "
+            "Requires --relative-coords."
+        ),
+    )
+    parser.add_argument(
+        "--include-global-motif",
+        action="store_true",
+        help=(
+            "When using --position-bins, also keep motif-only global features in the same output "
+            "(feature key is plain motif name)."
+        ),
+    )
+    parser.add_argument(
+        "--min-feature-genes",
+        type=int,
+        default=1,
+        help=(
+            "Keep only features present in at least this many genes (non-zero). "
+            "Useful for pruning very sparse motif-position features."
+        ),
+    )
+    parser.add_argument(
         "--fill-genes-from",
         type=str,
         default=None,
@@ -196,11 +223,39 @@ def convert_relative_to_genomic(hits: pd.DataFrame, args: argparse.Namespace) ->
     abs_end = np.where(s == "-", pend - rel_start, pstart + rel_end)
 
     out = merged.copy()
+    out["_rel_start"] = rel_start.astype(np.int64)
+    out["_rel_end"] = rel_end.astype(np.int64)
     out[args.chrom_col] = merged["_pa_chrom"].values
     out[args.start_col] = abs_start.astype(np.int64)
     out[args.end_col] = abs_end.astype(np.int64)
     out = out[out[args.end_col] > out[args.start_col]]
     return out
+
+
+def add_positional_feature_key(filtered: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if args.position_bins <= 0:
+        filtered["_feature_key"] = filtered[args.motif_col].astype(str)
+        return filtered
+
+    if not args.relative_coords:
+        raise ValueError("--position-bins requires --relative-coords so binning is promoter-relative")
+    ensure_columns(filtered, ["_rel_start", "_rel_end"], "filtered hits for positional bins")
+
+    promoter_len = int(args.promoter_upstream) + int(args.promoter_downstream)
+    if promoter_len <= 0:
+        raise ValueError("promoter length must be positive (promoter_upstream + promoter_downstream)")
+
+    rel_mid = (filtered["_rel_start"].astype(float).values + filtered["_rel_end"].astype(float).values) / 2.0
+    bin_idx = np.floor(rel_mid / promoter_len * int(args.position_bins)).astype(int)
+    bin_idx = np.clip(bin_idx, 0, int(args.position_bins) - 1)
+    pos_df = filtered.copy()
+    pos_df["_feature_key"] = pos_df[args.motif_col].astype(str) + "__bin" + bin_idx.astype(str)
+
+    if args.include_global_motif:
+        global_df = filtered.copy()
+        global_df["_feature_key"] = global_df[args.motif_col].astype(str)
+        return pd.concat([global_df, pos_df], axis=0, ignore_index=True)
+    return pos_df
 
 
 def main() -> None:
@@ -242,17 +297,19 @@ def main() -> None:
         mask = overlap_mask_for_chrom(hs, he, ps, pe)
         keep[idx] = mask
 
-    filtered = hits.loc[keep].copy()
+    filtered_base = hits.loc[keep].copy()
+    overlap_hits = len(filtered_base)
+    filtered = add_positional_feature_key(filtered_base, args)
 
     if filtered.empty:
         print("Warning: no motif hits overlap peaks; output will be all-zero if --fill-genes-from is provided.")
 
     if args.agg == "count":
-        vals = filtered.groupby([args.gene_col, args.motif_col]).size().rename("value").reset_index()
+        vals = filtered.groupby([args.gene_col, "_feature_key"]).size().rename("value").reset_index()
     else:
         ensure_columns(filtered, [args.score_col], "motif hits for maxscore aggregation")
         vals = (
-            filtered.groupby([args.gene_col, args.motif_col])[args.score_col]
+            filtered.groupby([args.gene_col, "_feature_key"])[args.score_col]
             .max()
             .rename("value")
             .reset_index()
@@ -261,7 +318,10 @@ def main() -> None:
     if vals.empty:
         mat = pd.DataFrame(index=pd.Index([], name=args.gene_col))
     else:
-        mat = vals.pivot(index=args.gene_col, columns=args.motif_col, values="value").fillna(0.0)
+        mat = vals.pivot(index=args.gene_col, columns="_feature_key", values="value").fillna(0.0)
+        if args.min_feature_genes > 1:
+            keep_cols = (mat != 0).sum(axis=0) >= int(args.min_feature_genes)
+            mat = mat.loc[:, keep_cols]
         mat = mat.sort_index(axis=0).sort_index(axis=1)
 
     if args.fill_genes_from is not None:
@@ -276,12 +336,14 @@ def main() -> None:
     mat.to_csv(out_path, sep="\t")
 
     total_hits = len(hits)
-    kept_hits = len(filtered)
-    frac = 0.0 if total_hits == 0 else kept_hits / total_hits
+    frac = 0.0 if total_hits == 0 else overlap_hits / total_hits
     print(f"Input hits: {total_hits}")
-    print(f"Hits overlapping peaks: {kept_hits} ({frac:.2%})")
+    print(f"Hits overlapping peaks: {overlap_hits} ({frac:.2%})")
     print(f"Output matrix: {out_path}")
-    print(f"Genes x motifs: {mat.shape[0]} x {mat.shape[1]}")
+    if args.position_bins > 0:
+        print(f"Genes x motif-position features: {mat.shape[0]} x {mat.shape[1]}")
+    else:
+        print(f"Genes x motifs: {mat.shape[0]} x {mat.shape[1]}")
 
 
 if __name__ == "__main__":

@@ -976,7 +976,7 @@ class EPInformer_promoter_v2(nn.Module):
 
 
 class MoPInformer_P(nn.Module):
-    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0):
+    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0, motif_gate_init=-2.0):
         super(MoPInformer_P, self).__init__()
         self.n_enhancer = n_enhancer
         self.out_dim = out_dim
@@ -1046,6 +1046,8 @@ class MoPInformer_P(nn.Module):
         )
         self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
         self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
+        # Start motif branch near-off so noisy motif features cannot easily hurt base performance.
+        self.motif_gate_logit = nn.Parameter(torch.tensor(float(motif_gate_init)))
 
 
     def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats = None):
@@ -1066,7 +1068,10 @@ class MoPInformer_P(nn.Module):
             motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
             query = self.cross_attn_norm_q(pe_flatten_embed)
             cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
-            pe_flatten_embed = pe_flatten_embed + cross_out
+            # Ignore all-zero motif vectors and softly gate motif contribution.
+            motif_valid = (motif_feats.abs().sum(dim=-1, keepdim=True) > 0).float().unsqueeze(-1)
+            motif_gate = torch.sigmoid(self.motif_gate_logit)
+            pe_flatten_embed = pe_flatten_embed + motif_gate * (cross_out * motif_valid)
 
         p_embed = pe_flatten_embed[:,0,:]
         expr_out = self.pToExpr(p_embed).squeeze(-1)
@@ -1075,7 +1080,7 @@ class MoPInformer_P(nn.Module):
 
 
 class MoPInformer_P_small(nn.Module):
-    def __init__(self, base_size = 4, n_encoder=2, out_dim=32, head = 2, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=16, cross_attn_dropout=0.0):
+    def __init__(self, base_size = 4, n_encoder=2, out_dim=32, head = 2, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=16, cross_attn_dropout=0.0, motif_gate_init=-2.0):
         super(MoPInformer_P_small, self).__init__()
         self.n_enhancer = n_enhancer
         self.out_dim = out_dim
@@ -1140,6 +1145,8 @@ class MoPInformer_P_small(nn.Module):
         )
         self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
         self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
+        # Start motif branch near-off so noisy motif features cannot easily hurt base performance.
+        self.motif_gate_logit = nn.Parameter(torch.tensor(float(motif_gate_init)))
 
 
     def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats = None):
@@ -1160,7 +1167,10 @@ class MoPInformer_P_small(nn.Module):
             motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
             query = self.cross_attn_norm_q(pe_flatten_embed)
             cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
-            pe_flatten_embed = pe_flatten_embed + cross_out
+            # Ignore all-zero motif vectors and softly gate motif contribution.
+            motif_valid = (motif_feats.abs().sum(dim=-1, keepdim=True) > 0).float().unsqueeze(-1)
+            motif_gate = torch.sigmoid(self.motif_gate_logit)
+            pe_flatten_embed = pe_flatten_embed + motif_gate * (cross_out * motif_valid)
 
         p_embed = pe_flatten_embed[:,0,:]
         expr_out = self.pToExpr(p_embed).squeeze(-1)
@@ -1170,7 +1180,7 @@ class MoPInformer_P_small(nn.Module):
 
 
 class MoPInformer(nn.Module):
-    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0):
+    def __init__(self, base_size = 4, n_encoder=3, out_dim=128, head = 4, pre_trained_encoder= None, n_enhancer=50, device='cuda', useBN=True, usePromoterSignal=True, useFeat=True, n_extraFeat=0, useLN=True, motif_feat_dim=1796, motif_hidden_dim=128, cross_attn_dropout=0.0, motif_gate_init=-2.0):
         super(MoPInformer, self).__init__()
         self.n_enhancer = n_enhancer
         self.out_dim = out_dim
@@ -1259,6 +1269,8 @@ class MoPInformer(nn.Module):
         )
         self.cross_attn = nn.MultiheadAttention(self.out_dim, head, dropout=cross_attn_dropout, batch_first=True)
         self.cross_attn_norm_q = nn.LayerNorm(self.out_dim)
+        # Start motif branch near-off so noisy motif features cannot easily hurt base performance.
+        self.motif_gate_logit = nn.Parameter(torch.tensor(float(motif_gate_init)))
 
     def forward(self, pe_seq, rna_feats=None, enh_feats=None, motif_feats=None):
         enhancers_padding_mask = ~(pe_seq.sum(-1).sum(-1) > 0).bool()
@@ -1278,7 +1290,10 @@ class MoPInformer(nn.Module):
             motif_tokens = self.motif_encoder(motif_feats.float()).unsqueeze(1)
             query = self.cross_attn_norm_q(pe_flatten_embed)
             cross_out, cross_attn_w = self.cross_attn(query, motif_tokens, motif_tokens)
-            pe_flatten_embed = pe_flatten_embed + cross_out
+            # Ignore all-zero motif vectors and softly gate motif contribution.
+            motif_valid = (motif_feats.abs().sum(dim=-1, keepdim=True) > 0).float().unsqueeze(-1)
+            motif_gate = torch.sigmoid(self.motif_gate_logit)
+            pe_flatten_embed = pe_flatten_embed + motif_gate * (cross_out * motif_valid)
 
         p_embed = pe_flatten_embed[:,0,:]
         if rna_feats is not None:

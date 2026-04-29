@@ -2,6 +2,8 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import sys
 import argparse
+import random
+from pathlib import Path
 from datetime import datetime
 import os
 import scripts.utils_forTraining as utils
@@ -29,6 +31,7 @@ from dataclasses import dataclass
 from scipy.stats import pearsonr
 
 from sklearn.model_selection import train_test_split
+from sklearn.decomposition import TruncatedSVD
 from kipoiseq import Interval
 import pyfaidx
 import kipoiseq
@@ -68,6 +71,23 @@ def one_hot_encode(sequence):
     return kipoiseq.transforms.functional.one_hot_dna(sequence, neutral_value=0.0).astype(np.float32)
 
 fasta_extractor = FastaStringExtractor("/home/ruian7p/Projects/puffin/resources/hg38.fa")
+
+
+def seed_everything(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
 class promoter_enhancer_dataset(Dataset):
     def __init__(self, cell_type='K562', expr_type='RNA', n_enh_feats=3, disable_enh=False, distance_thr=None, max_n_enh=200, use_prm_signal=False, rm_prm_seq=False, motif_feat_path=None):
@@ -169,6 +189,37 @@ class promoter_enhancer_dataset(Dataset):
 def get_lr(optimizer):
     for param_group in optimizer.param_groups:
         return param_group['lr']
+    
+def preprocess_motif_features(motif_df, train_ids, use_log1p=False, use_zscore=False, svd_dim=0, eps=1e-6):
+    if motif_df is None:
+        return None
+    out = motif_df.copy()
+
+    if use_log1p:
+        out = np.log1p(np.maximum(out.values, 0.0))
+        out = pd.DataFrame(out, index=motif_df.index, columns=motif_df.columns)
+
+    if use_zscore:
+        train_ids = [eid for eid in train_ids if eid in out.index]
+        if len(train_ids) > 0:
+            train_block = out.loc[train_ids]
+            mu = train_block.mean(axis=0)
+            sigma = train_block.std(axis=0).replace(0, np.nan)
+            out = (out - mu) / (sigma + eps)
+            out = out.fillna(0.0)
+
+    # Keep all motif information but compress to a more learnable low-rank space.
+    if int(svd_dim) > 0 and out.shape[1] > int(svd_dim):
+        train_ids = [eid for eid in train_ids if eid in out.index]
+        if len(train_ids) > 1:
+            n_comp = min(int(svd_dim), max(1, len(train_ids) - 1), max(1, out.shape[1] - 1))
+            svd = TruncatedSVD(n_components=n_comp, random_state=42)
+            svd.fit(out.loc[train_ids].values)
+            transformed = svd.transform(out.values)
+            cols = [f'motif_svd_{i}' for i in range(n_comp)]
+            out = pd.DataFrame(transformed, index=out.index, columns=cols)
+    return out
+
 
 class Logger():
     """A logging class that can report or save metrics.
@@ -284,7 +335,7 @@ class EarlyStopping:
         # torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
         
-def train(net, training_dataset, fold_i, saved_model_path='./models/', learning_rate=1e-4, model_logger=None, fixed_encoder = False, valid_dataset = None, model_name = '', batch_size = 64, device = 'cuda', stratify=None, class_weight=None, EPOCHS=100, valid_size=1000):
+def train(net, training_dataset, fold_i, saved_model_path='./models/', learning_rate=1e-4, model_logger=None, fixed_encoder = False, valid_dataset = None, model_name = '', batch_size = 64, device = 'cuda', stratify=None, class_weight=None, EPOCHS=100, valid_size=1000, early_stop_patience=5):
     if not os.path.exists(saved_model_path):
         os.mkdir(saved_model_path)
     if valid_dataset is not None:
@@ -304,7 +355,7 @@ def train(net, training_dataset, fold_i, saved_model_path='./models/', learning_
     
     print("fold", fold_i ,"training data:", len(train_ds), "validated data:", len(valid_ds), 'total data:', len(training_dataset))
     trainloader = data_utils.DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
-    early_stopping = EarlyStopping(patience=5,
+    early_stopping = EarlyStopping(patience=early_stop_patience,
                verbose=True, path= saved_model_path + "/fold_" + str(fold_i) + "_best_"+model_name+"_checkpoint.pt")
 
     L_expr = nn.SmoothL1Loss() # L1KLmixed()# nn.SmoothL1Loss()
@@ -456,8 +507,16 @@ parser.add_argument('--use_pretrained_encoder', type=bool, help='use pretrained 
 parser.add_argument('--rm_prm_seq', type=bool, help='remove promoter sequence', default=False)
 parser.add_argument('--fold', type=str, help='fold name without prefix, e.g. "1", "borzoi", or "all"', default='borzoi')
 parser.add_argument('--motif_path', type=str, help='path to promoter motif feature table', default='./data/promoter_2k_motif_hits.tsv')
+parser.add_argument('--lr', type=float, help='learning rate', default=5e-4)
+parser.add_argument('--early_stop_patience', type=int, help='early stopping patience', default=5)
+parser.add_argument('--motif_log1p', action='store_true', help='apply log1p transform to motif features')
+parser.add_argument('--motif_zscore', action='store_true', help='z-score motif features using train-fold statistics')
+parser.add_argument('--motif_svd_dim', type=int, help='optional SVD dimension for motif features (0 to disable)', default=0)
+parser.add_argument('--seed', type=int, help='global random seed for reproducible training', default=42)
 args = parser.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"]= str(args.cuda_id)
+seed_everything(args.seed)
+print('seed:', args.seed)
 os.makedirs('/dev/shm/data/', exist_ok=True)
 # copy data 
 
@@ -467,7 +526,7 @@ expr_type = args.expr_type
 batch_size = 64
 max_n_enh = 60
 dist_thr = 100_000
-lr = 5e-4
+lr = args.lr
 model_type = args.model_type
 use_pretrained_encoder = args.use_pretrained_encoder
 cell_type = args.cell
@@ -505,6 +564,27 @@ for fi in fold_ids:# range(1, 13):
                 train_ensid = split_df[split_df[fold_i] == 'train'].index
                 valid_ensid = split_df[split_df[fold_i] == 'valid'].index
                 test_ensid = split_df[split_df[fold_i] == 'test'].index
+                if ds.motif_df is not None and (args.motif_log1p or args.motif_zscore or args.motif_svd_dim > 0):
+                    ds.motif_df = preprocess_motif_features(
+                        ds.motif_df,
+                        train_ids=list(train_ensid),
+                        use_log1p=args.motif_log1p,
+                        use_zscore=args.motif_zscore,
+                        svd_dim=args.motif_svd_dim,
+                    )
+                    ds.motif_feat_dim = ds.motif_df.shape[1]
+                if ds.motif_df is not None:
+                    def _zero_pct(ids):
+                        ids = [eid for eid in ids if eid in ds.motif_df.index]
+                        if len(ids) == 0:
+                            return float('nan')
+                        x = ds.motif_df.loc[ids].values
+                        return float((x.sum(axis=1) == 0).mean() * 100)
+                    z_tr = _zero_pct(train_ensid)
+                    z_va = _zero_pct(valid_ensid)
+                    z_te = _zero_pct(test_ensid)
+                    print('motif_feat_dim:', ds.motif_feat_dim, 'motif_zero% train/valid/test:',
+                          f'{z_tr:.2f}/{z_va:.2f}/{z_te:.2f}')
                 ensid_list = [eid.decode('utf-8') for eid in ds.data_h5['ensid'][:]]    
                 ensid_df = pd.DataFrame(ensid_list, columns=['ensid'])
                 ensid_df['idx'] = np.arange(len(ensid_list))
@@ -541,7 +621,19 @@ for fi in fold_ids:# range(1, 13):
                 use_rna_feats_flag = 'rnafeats' if use_rna_feats else 'nornafeats'
                 use_prm_signal_flag = 'prmsig' if use_prm_signal else 'nonprmsig'
                 rm_prm_signal_flag = 'rmprmseq' if rm_prm_seq else 'nonrmprmseq'
-                model.name = model.name + '.{}.{}.{}enhs.{}feats.{}.{}.{}.{}kb2TSS'.format(cell, expr_type, max_n_enh, n_enh_feats, use_rna_feats_flag, use_prm_signal_flag, rm_prm_signal_flag, str(int(dist_thr/1000)))
+                motif_tag = 'nomotif'
+                if ds.motif_feat_dim > 0:
+                    motif_tag = Path(args.motif_path).stem
+                    if args.motif_log1p:
+                        motif_tag = motif_tag + '.log1p'
+                    if args.motif_zscore:
+                        motif_tag = motif_tag + '.zscore'
+                    if args.motif_svd_dim > 0:
+                        motif_tag = motif_tag + f'.svd{args.motif_svd_dim}'
+                model.name = model.name + '.{}.{}.{}enhs.{}feats.{}.{}.{}.{}kb2TSS.{}'.format(
+                    cell, expr_type, max_n_enh, n_enh_feats, use_rna_feats_flag,
+                    use_prm_signal_flag, rm_prm_signal_flag, str(int(dist_thr/1000)), motif_tag
+                )
                 # Test loading pre-trained EPInformer
                 model_parameters = filter(lambda p: p.requires_grad, model.parameters())  
                 total_params = sum(np.prod(p.size()) for p in model_parameters)  
@@ -549,7 +641,7 @@ for fi in fold_ids:# range(1, 13):
                 print(model.name)
                 saved_model_path = f'./results/{model_type}/'
                 # Train the model
-                train(model, train_ds, valid_dataset=valid_ds, learning_rate=lr, EPOCHS=50, model_name = model.name, fold_i=fi, batch_size=batch_size, device=device, saved_model_path=saved_model_path)
+                train(model, train_ds, valid_dataset=valid_ds, learning_rate=lr, EPOCHS=50, model_name = model.name, fold_i=fi, batch_size=batch_size, device=device, saved_model_path=saved_model_path, early_stop_patience=args.early_stop_patience)
                 # Test the model
                 test_df = test(model, test_ds, model_name = model.name, saved_model_path=saved_model_path, fold_i=fi, batch_size=batch_size, device=device)
                 test_df['cell'] = cell
